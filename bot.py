@@ -3,6 +3,10 @@ import html
 import logging
 import os
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import os
+
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -20,6 +24,21 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError
 
 import database as db
+
+# Render portni ko'rib tinchlanishi uchun soxta server
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot ishlayapti!")
+
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
+# Serverni alohida oqimda ishga tushiramiz
+threading.Thread(target=run_server, daemon=True).start()
 
 
 # ==================================================
