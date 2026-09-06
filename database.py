@@ -12,8 +12,11 @@ logger = logging.getLogger(__name__)
 
 def get_connection():
 
-    conn = sqlite3.connect(DB_NAME)
+    # Bir nechta Telegram update bir vaqtda database'ga murojaat qilganda
+    # SQLite "database is locked" xatosini kamaytirish uchun kutish vaqti.
+    conn = sqlite3.connect(DB_NAME, timeout=30)
 
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
 
     return conn
