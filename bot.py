@@ -3,14 +3,10 @@ import html
 import logging
 import os
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
-import os
-
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import (
     Message,
     BotCommand,
@@ -24,21 +20,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError
 
 import database as db
-
-# Render portni ko'rib tinchlanishi uchun soxta server
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot ishlayapti!")
-
-def run_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    server.serve_forever()
-
-# Serverni alohida oqimda ishga tushiramiz
-threading.Thread(target=run_server, daemon=True).start()
 
 
 # ==================================================
@@ -102,6 +83,9 @@ bot = Bot(
 )
 
 dp = Dispatcher()
+
+# Ommaviy yuklashdagi bir vaqtda keladigan media update larni navbatlaymiz.
+bulk_upload_lock = asyncio.Lock()
 
 
 # ==================================================
@@ -572,7 +556,8 @@ async def user_search_handler(
 # ==================================================
 
 @dp.message(
-    F.text &
+    StateFilter(None),
+    F.text,
     ~F.text.startswith("/")
 )
 async def direct_search(
@@ -2353,7 +2338,7 @@ async def receive_episode_number(
 
 @dp.message(
     AddEpisodeState.waiting_for_video,
-    F.video
+    F.video | F.document
 )
 async def receive_video(
     message: Message,
@@ -2392,11 +2377,27 @@ async def receive_video(
 
         return
 
+    file_id = None
+
+    if message.video:
+        file_id = message.video.file_id
+    elif message.document:
+        mime_type = (message.document.mime_type or "").lower()
+        if mime_type.startswith("video/"):
+            file_id = message.document.file_id
+
+    if not file_id:
+        await message.answer(
+            "⚠️ Bu xabar video fayl sifatida qabul qilinmadi.\n\n"
+            "🎥 Videoni oddiy video yoki video fayl sifatida yuboring."
+        )
+        return
+
     success = db.add_episode(
         movie_id,
         season,
         episode,
-        message.video.file_id
+        file_id
     )
 
     if not success:
@@ -2833,92 +2834,83 @@ async def bulk_video(
     message: Message,
     state: FSMContext
 ):
-    """Ommaviy yuklash: har bir video avtomatik keyingi qismga yoziladi."""
+    """Ommaviy yuklash: 1-video=1-qism, 2-video=2-qism va hokazo."""
 
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
+    async with bulk_upload_lock:
+        if not is_admin(message.from_user.id):
+            await state.clear()
+            return
 
-    data = await state.get_data()
+        data = await state.get_data()
+        movie_id = data.get("movie_id")
+        season = data.get("season")
+        episode = data.get("episode")
 
-    movie_id = data.get("movie_id")
-    season = data.get("season")
-    episode = data.get("episode")
+        if not movie_id or not season or not episode:
+            await state.clear()
+            await message.answer(
+                "❌ Ommaviy yuklash sessiyasi buzilgan.\n\n"
+                "Qaytadan boshlang.",
+                reply_markup=admin_keyboard()
+            )
+            return
 
-    if not movie_id or not season or not episode:
-        await state.clear()
-        await message.answer(
-            "❌ Ommaviy yuklash sessiyasi buzilgan.\n\n"
-            "Qaytadan boshlang.",
-            reply_markup=admin_keyboard()
+        file_id = None
+        if message.video:
+            file_id = message.video.file_id
+        elif message.document:
+            mime_type = (message.document.mime_type or "").lower()
+            if mime_type.startswith("video/"):
+                file_id = message.document.file_id
+
+        if not file_id:
+            await message.answer(
+                "⚠️ Bu xabar video sifatida qabul qilinmadi.\n\n"
+                "🎥 Videoni oddiy video yoki video fayl sifatida yuboring.\n\n"
+                f"Hozir kutilayotgan qism: <b>{episode}-qism</b>",
+                parse_mode="HTML"
+            )
+            return
+
+        success = db.add_episode(
+            movie_id,
+            season,
+            episode,
+            file_id
         )
-        return
 
-    # Oddiy Telegram video.
-    file_id = None
-    if message.video:
-        file_id = message.video.file_id
+        if not success:
+            await message.answer(
+                "❌ <b>VIDEO SAQLANMADI</b>\n\n"
+                f"🎬 Kino ID: <code>{movie_id}</code>\n"
+                f"📺 {season}-fasl\n"
+                f"🔢 {episode}-qism\n\n"
+                "⚠️ Qism raqami o'zgartirilmadi.\n"
+                "Videoni qayta yuboring yoki yuklashni to'xtating.",
+                parse_mode="HTML"
+            )
+            return
 
-    # Telegram videoni File/Document sifatida yuborsa ham qabul qilamiz.
-    elif message.document:
-        mime_type = (message.document.mime_type or "").lower()
-        if mime_type.startswith("video/"):
-            file_id = message.document.file_id
+        next_episode = episode + 1
+        await state.update_data(episode=next_episode)
 
-    if not file_id:
         await message.answer(
-            "⚠️ Bu xabar video sifatida qabul qilinmadi.\n\n"
-            "🎥 Videoni oddiy video qilib yuboring yoki 'File' sifatida yuborsangiz,\n"
-            "video fayl ekaniga ishonch hosil qiling.\n\n"
-            f"Hozir kutilayotgan qism: <b>{episode}-qism</b>",
-            parse_mode="HTML"
-        )
-        return
-
-    success = db.add_episode(
-        movie_id,
-        season,
-        episode,
-        file_id
-    )
-
-    if not success:
-        # Xatoda qism raqami oshirilmaydi — shu qismga qayta uriniladi.
-        await message.answer(
-            "❌ <b>VIDEO SAQLANMADI</b>\n\n"
-            f"🎬 Kino ID: <code>{movie_id}</code>\n"
+            "✅ <b>SAQLANDI!</b>\n\n"
             f"📺 {season}-fasl\n"
             f"🔢 {episode}-qism\n\n"
-            "⚠️ Qism raqami o'zgartirilmadi.\n"
-            "Videoni qayta yuboring yoki yuklashni to'xtating.",
+            f"➡️ Keyingi video: <b>{next_episode}-qism</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🛑 To'xtatish",
+                            callback_data="bulk_stop"
+                        )
+                    ]
+                ]
+            ),
             parse_mode="HTML"
         )
-        return
-
-    next_episode = episode + 1
-
-    await state.update_data(
-        episode=next_episode
-    )
-
-    await message.answer(
-        "✅ <b>SAQLANDI!</b>\n\n"
-        f"📺 {season}-fasl\n"
-        f"🔢 {episode}-qism\n\n"
-        f"➡️ Keyingi video: <b>{next_episode}-qism</b>",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🛑 To'xtatish",
-                        callback_data="bulk_stop"
-                    )
-                ]
-            ]
-        ),
-        parse_mode="HTML"
-    )
-
 
 
 # ==================================================
